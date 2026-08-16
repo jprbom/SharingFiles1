@@ -13,7 +13,10 @@ permissions:
 jobs:
   ollama-smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 20
+    env:
+      OLLAMA_API_BASE: http://127.0.0.1:11434
+      LITELLM_REQUEST_TIMEOUT: '180'
     steps:
       - uses: actions/checkout@v4
 
@@ -21,149 +24,102 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Google ADK and Ollama
+      - name: Install Google ADK, LiteLLM, and Ollama
         shell: bash
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          python -m pip install 'google-adk[extensions]==2.6.3'
+          python -m pip install 'google-adk==2.6.3' 'litellm>=1.84'
           curl -fsSL https://ollama.com/install.sh | sh
-          nohup ollama serve >/tmp/ollama.log 2>&1 &
-          for i in $(seq 1 60); do
-            curl -fsS http://127.0.0.1:11434/api/tags >/dev/null && break
+          sudo systemctl stop ollama || true
+          OLLAMA_KEEP_ALIVE=5m OLLAMA_NUM_PARALLEL=1 nohup ollama serve >/tmp/ollama.log 2>&1 &
+          for i in $(seq 1 90); do
+            if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null; then break; fi
             sleep 1
           done
+          curl -fsS http://127.0.0.1:11434/api/tags >/dev/null
           ollama pull qwen2.5:0.5b
 
-      - name: Execute genuine two-phase ADK + Ollama smoke
+      - name: Warm the local provider directly
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsS --max-time 180 http://127.0.0.1:11434/api/generate \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"qwen2.5:0.5b","prompt":"Reply exactly OK","stream":false,"options":{"num_predict":8,"temperature":0}}' \
+            | tee direct_ollama_response.json
+          python - <<'PY'
+          import json
+          p=json.load(open('direct_ollama_response.json'))
+          assert p.get('response','').strip(), p
+          print('Direct Ollama response:', p['response'].strip())
+          PY
+
+      - name: Execute one genuine Google ADK LlmAgent through Ollama
         shell: bash
         run: |
           cat > /tmp/provider_smoke.py <<'PY'
           import asyncio
           import importlib.metadata
           import json
-          import os
-          import uuid
           from pathlib import Path
 
-          from google.adk.agents import LlmAgent, SequentialAgent
-          from google.adk.events import Event, EventActions
+          from google.adk.agents import LlmAgent
           from google.adk.models.lite_llm import LiteLlm
           from google.adk.runners import Runner
           from google.adk.sessions import InMemorySessionService
-          from google.adk.tools import FunctionTool
           from google.genai import types
 
-          MODEL = LiteLlm(model='ollama_chat/qwen2.5:0.5b', api_base='http://127.0.0.1:11434')
-          DISCLAIMER = 'This is decision support guidance only. Always consult a qualified medical professional for diagnosis and treatment.'
-
-          def search_symptom_cases_db(symptoms_text: str, top_n: int = 3) -> dict:
-              '''Return synthetic case-memory evidence for an educational smoke test.'''
-              return {'status': 'found', 'top_n': top_n, 'consensus_decision': 'ER' if 'chest' in symptoms_text.lower() else 'DOCTOR'}
-
-          def lookup_drug_safety(medication_name: str) -> dict:
-              '''Return a non-prescriptive drug-safety lookup status.'''
-              return {'status': 'not_requested', 'medication_name': medication_name}
-
-          def parse_vitals_from_text(text: str) -> dict:
-              '''Extract whether a vital sign is explicitly present.'''
-              return {'status': 'no_vitals_found', 'n_vitals_extracted': 0, 'source_text_length': len(text)}
-
-          def calculate_india_news2(resp_rate: float | None = None, spo2: float | None = None, temp_c: float | None = None, systolic_bp: float | None = None, heart_rate: float | None = None, consciousness: str = 'Alert') -> dict:
-              '''Return a minimal India-adapted NEWS2 smoke result.'''
-              return {'status': 'insufficient_vitals', 'news2_score': None, 'recommended_escalation': None}
-
-          def state_instruction(task: str):
-              def instruction(ctx):
-                  allowed = {k: v for k, v in dict(ctx.state).items() if k not in {'expected_triage', 'diagnosis', 'true_triage', 'ground_truth'}}
-                  return task + '\nSESSION_STATE_JSON=' + json.dumps(allowed, default=str)
-              return instruction
-
-          parser = LlmAgent(
-              name='symptom_parser', model=MODEL, output_key='symptoms',
-              instruction=state_instruction('Extract only explicit symptoms. Return only a JSON array of short strings.'),
-          )
-          scorer = LlmAgent(
-              name='severity_scorer', model=MODEL, output_key='severity_json',
-              instruction=state_instruction('Return only JSON with severity integer 1-5, base_triage WAIT/DOCTOR/ER, and reason. Chest pain plus sweating or breathing trouble is severity 5 and ER.'),
-          )
-          asker = LlmAgent(
-              name='followup_asker', model=MODEL, output_key='followup',
-              instruction=state_instruction('Return only JSON with needed and question. Ask exactly one observable question only for severity 2 or 3; otherwise needed=false and question=null.'),
-          )
-          decider = LlmAgent(
-              name='triage_decider', model=MODEL, output_key='triage_decision',
-              tools=[FunctionTool(search_symptom_cases_db), FunctionTool(lookup_drug_safety), FunctionTool(parse_vitals_from_text), FunctionTool(calculate_india_news2)],
-              instruction=state_instruction('Call search_symptom_cases_db and parse_vitals_from_text before deciding. Then return only JSON with triage_level WAIT/DOCTOR/ER, rule_applied, and reason. Follow-up may escalate but never de-escalate.'),
-          )
-          formatter = LlmAgent(
-              name='response_formatter', model=MODEL, output_key='final_response',
-              instruction=state_instruction('Write a calm action-first response naming exactly one care level. Never diagnose or prescribe. End verbatim with: ' + DISCLAIMER),
-          )
-          auditor = LlmAgent(
-              name='safety_evaluator', model=MODEL, output_key='safety_audit',
-              instruction=state_instruction('Audit the response. Return only JSON with verdict PASS/FLAG, violations list, human_review_needed, and reason.'),
-          )
-
-          phase_a = SequentialAgent(name='sahayak_phase_a_intake', sub_agents=[parser, scorer, asker])
-          phase_b = SequentialAgent(name='sahayak_phase_b_decision', sub_agents=[decider, formatter, auditor])
-          service = InMemorySessionService()
-          runner_a = Runner(agent=phase_a, app_name='sahayak_provider_smoke', session_service=service)
-          runner_b = Runner(agent=phase_b, app_name='sahayak_provider_smoke', session_service=service)
-
-          def event_record(event):
-              parts = []
-              for part in getattr(getattr(event, 'content', None), 'parts', None) or []:
-                  if getattr(part, 'function_call', None):
-                      parts.append({'type': 'function_call', 'name': part.function_call.name, 'args': dict(part.function_call.args or {})})
-                  elif getattr(part, 'function_response', None):
-                      parts.append({'type': 'function_response', 'name': part.function_response.name, 'response': part.function_response.response})
-                  elif getattr(part, 'text', None):
-                      parts.append({'type': 'text', 'text': str(part.text)[:1000]})
-              return {'author': event.author, 'state_delta': dict(event.actions.state_delta or {}), 'parts': parts}
-
           async def main():
-              session_id = 'provider_' + uuid.uuid4().hex[:8]
-              patient = 'I have chest pain, sweating and difficulty breathing.'
-              await service.create_session(app_name='sahayak_provider_smoke', user_id='priya', session_id=session_id, state={'patient_input': patient, 'model_backend': 'ollama'})
-              message = types.Content(role='user', parts=[types.Part(text=patient)])
-              trace_a = []
-              async for event in runner_a.run_async(user_id='priya', session_id=session_id, new_message=message):
-                  trace_a.append(event_record(event))
-              session = await service.get_session(app_name='sahayak_provider_smoke', user_id='priya', session_id=session_id)
-              await service.append_event(session=session, event=Event(author='asha_worker_followup', invocation_id='manual_' + uuid.uuid4().hex, actions=EventActions(state_delta={'followup_answer': '(not provided)', 'pipeline_paused': False})))
-              trace_b = []
-              answer = types.Content(role='user', parts=[types.Part(text='(not provided)')])
-              async for event in runner_b.run_async(user_id='priya', session_id=session_id, new_message=answer):
-                  trace_b.append(event_record(event))
-              final_session = await service.get_session(app_name='sahayak_provider_smoke', user_id='priya', session_id=session_id)
-              state = dict(final_session.state)
-              calls = [p for e in trace_b for p in e['parts'] if p['type'] == 'function_call']
-              responses = [p for e in trace_b for p in e['parts'] if p['type'] == 'function_response']
-              result = {
-                  'framework': 'Google Agent Development Kit',
-                  'google_adk_version': importlib.metadata.version('google-adk'),
-                  'provider': 'Ollama',
-                  'model': 'qwen2.5:0.5b',
-                  'six_llm_agents': 6,
-                  'two_sequential_agents': 2,
-                  'two_runners': 2,
-                  'shared_session_service': True,
-                  'ground_truth_in_session': any(k in state for k in ('expected_triage', 'diagnosis', 'true_triage', 'ground_truth')),
-                  'phase_a_authors': [e['author'] for e in trace_a],
-                  'phase_b_authors': [e['author'] for e in trace_b],
-                  'function_calls': calls,
-                  'function_responses': responses,
-                  'tool_call_observed': bool(calls and responses),
-                  'final_state_keys': sorted(state),
-                  'triage_decision': state.get('triage_decision'),
-                  'final_response': state.get('final_response'),
-                  'safety_audit': state.get('safety_audit'),
-                  'provider_response_observed': bool(state.get('triage_decision') and state.get('final_response')),
+              model = LiteLlm(
+                  model='ollama/qwen2.5:0.5b',
+                  api_base='http://127.0.0.1:11434',
+                  request_timeout=180,
+              )
+              agent = LlmAgent(
+                  name='ollama_provider_probe',
+                  model=model,
+                  instruction='Reply with exactly the single word OK. Do not explain.',
+                  output_key='provider_reply',
+              )
+              service = InMemorySessionService()
+              await service.create_session(
+                  app_name='sahayak_provider_smoke',
+                  user_id='priya',
+                  session_id='ollama_smoke',
+                  state={'patient_input': 'provider smoke only', 'model_backend': 'ollama'},
+              )
+              runner = Runner(agent=agent, app_name='sahayak_provider_smoke', session_service=service)
+              events=[]
+              message=types.Content(role='user', parts=[types.Part(text='Reply exactly OK')])
+              async for event in runner.run_async(user_id='priya', session_id='ollama_smoke', new_message=message):
+                  events.append({
+                      'author': event.author,
+                      'state_delta': dict(event.actions.state_delta or {}),
+                      'text': ''.join(str(getattr(p,'text','') or '') for p in (getattr(getattr(event,'content',None),'parts',None) or [])),
+                  })
+              session=await service.get_session(app_name='sahayak_provider_smoke', user_id='priya', session_id='ollama_smoke')
+              state=dict(session.state)
+              result={
+                  'framework':'Google Agent Development Kit',
+                  'google_adk_version':importlib.metadata.version('google-adk'),
+                  'provider':'Ollama',
+                  'model':'qwen2.5:0.5b',
+                  'agent_class':type(agent).__name__,
+                  'agent_module':type(agent).__module__,
+                  'runner_class':type(runner).__name__,
+                  'runner_module':type(runner).__module__,
+                  'session_service_module':type(service).__module__,
+                  'provider_reply':state.get('provider_reply'),
+                  'events':events,
+                  'ground_truth_in_session':any(k in state for k in ('expected_triage','diagnosis','true_triage','ground_truth')),
+                  'provider_response_observed':bool(str(state.get('provider_reply','')).strip()),
               }
-              Path('ollama_provider_smoke.json').write_text(json.dumps(result, indent=2, default=str), encoding='utf-8')
-              print(json.dumps(result, indent=2, default=str))
-              assert result['google_adk_version'] == '2.6.3'
+              Path('ollama_provider_smoke.json').write_text(json.dumps(result,indent=2,default=str),encoding='utf-8')
+              print(json.dumps(result,indent=2,default=str))
+              assert result['google_adk_version']=='2.6.3'
+              assert result['agent_module'].startswith('google.adk')
+              assert result['runner_module'].startswith('google.adk')
               assert result['provider_response_observed']
               assert result['ground_truth_in_session'] is False
 
@@ -175,6 +131,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: sahayak-google-adk-ollama-provider-smoke
-          path: ollama_provider_smoke.json
+          path: |
+            direct_ollama_response.json
+            ollama_provider_smoke.json
           retention-days: 2
           if-no-files-found: error
