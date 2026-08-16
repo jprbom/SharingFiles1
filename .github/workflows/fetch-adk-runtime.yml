@@ -28,7 +28,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          python -m pip install --target adk_site "google-adk==2.6.3"
+          python -m pip install --target adk_site "google-adk[extensions]==2.6.3"
           python - <<'PY'
           import importlib.metadata
           import pathlib
@@ -36,6 +36,7 @@ jobs:
 
           sys.path.insert(0, str(pathlib.Path('adk_site').resolve()))
           from google.adk.agents import LlmAgent, ParallelAgent, SequentialAgent
+          from google.adk.models.lite_llm import LiteLlm
           from google.adk.runners import Runner
           from google.adk.sessions import InMemorySessionService
 
@@ -43,9 +44,9 @@ jobs:
           assert version == '2.6.3', version
           print('google-adk', version)
           print(LlmAgent.__module__, SequentialAgent.__module__, ParallelAgent.__module__)
-          print(Runner.__module__, InMemorySessionService.__module__)
+          print(Runner.__module__, InMemorySessionService.__module__, LiteLlm.__module__)
           pathlib.Path('adk_site/ADK_RUNTIME_BUILD.txt').write_text(
-              'google-adk=2.6.3\npython=3.13\nplatform=ubuntu-latest x86_64\n',
+              'google-adk=2.6.3\nextras=extensions\npython=3.13\nplatform=ubuntu-latest x86_64\n',
               encoding='utf-8',
           )
           PY
@@ -53,7 +54,7 @@ jobs:
       - name: Upload runtime bundle
         uses: actions/upload-artifact@v4
         with:
-          name: google-adk-2.6.3-py313-linux-x86_64-site-packages
+          name: google-adk-2.6.3-extensions-py313-linux-x86_64-site-packages
           path: adk_site
           retention-days: 1
           compression-level: 6
